@@ -2716,34 +2716,10 @@ MiEnablePagingOfDriver(IN PLDR_DATA_TABLE_ENTRY LdrEntry)
     if (PointerPte) MiSetPagingOfDriver(PointerPte, LastPte);
 }
 
-BOOLEAN
-NTAPI
-MmVerifyImageIsOkForMpUse(IN PVOID BaseAddress)
-{
-    PIMAGE_NT_HEADERS NtHeader;
-    PAGED_CODE();
-
-    /* Get NT Headers */
-    NtHeader = RtlImageNtHeader(BaseAddress);
-    if (NtHeader)
-    {
-        /* Check if this image is only safe for UP while we have 2+ CPUs */
-        if ((KeNumberProcessors > 1) &&
-            (NtHeader->FileHeader.Characteristics & IMAGE_FILE_UP_SYSTEM_ONLY))
-        {
-            /* Fail */
-            return FALSE;
-        }
-    }
-
-    /* Otherwise, it's safe */
-    return TRUE;
-}
-
 NTSTATUS
 NTAPI
-MmCheckSystemImage(IN HANDLE ImageHandle,
-                   IN BOOLEAN PurgeSection)
+MmCheckSystemImage(
+    _In_ HANDLE ImageHandle)
 {
     NTSTATUS Status;
     HANDLE SectionHandle;
@@ -2838,7 +2814,8 @@ MmCheckSystemImage(IN HANDLE ImageHandle,
         }
 
         /* Check that it's a valid SMP image if we have more then one CPU */
-        if (!MmVerifyImageIsOkForMpUse(ViewBase))
+        if (KeNumberProcessors > 1 &&
+            (NtHeaders->FileHeader.Characteristics & IMAGE_FILE_UP_SYSTEM_ONLY))
         {
             /* Otherwise it's not the right image */
             Status = STATUS_IMAGE_MP_UP_MISMATCH;
@@ -3171,7 +3148,7 @@ LoaderScan:
         }
 
         /* Validate it */
-        Status = MmCheckSystemImage(FileHandle, FALSE);
+        Status = MmCheckSystemImage(FileHandle);
         if ((Status == STATUS_IMAGE_CHECKSUM_MISMATCH) ||
             (Status == STATUS_IMAGE_MP_UP_MISMATCH) ||
             (Status == STATUS_INVALID_IMAGE_PROTECT))
