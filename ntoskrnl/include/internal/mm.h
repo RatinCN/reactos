@@ -1810,6 +1810,12 @@ VOID
 NTAPI
 MiInitializeWorkingSetList(_Inout_ PMMSUPPORT WorkingSet);
 
+/* aslr.c *****************************************************************/
+
+VOID
+NTAPI
+MiInitializeRelocations();
+
 #ifdef __cplusplus
 } // extern "C"
 

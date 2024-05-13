@@ -298,6 +298,9 @@ MmInitSystem(IN ULONG Phase,
     }
     ExReleaseResourceLite(&PsLoadedModuleResource);
 
+    /* Initialize ASLR */
+    MiInitializeRelocations();
+
     return TRUE;
 }
 
