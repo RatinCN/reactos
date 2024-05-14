@@ -14,6 +14,8 @@
 /* DEPENDENCIES ***************************************************************/
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <search.h>
 
 /* Native Headers */
 #define WIN32_NO_STATUS
@@ -73,6 +75,12 @@ typedef struct _SMP_SUBSYSTEM
     BOOLEAN Terminating;
     ULONG ReferenceCount;
 } SMP_SUBSYSTEM, *PSMP_SUBSYSTEM;
+
+typedef struct _SMP_RANDOMIZE_DLLNODE
+{
+    ULONG Random;
+    PLIST_ENTRY DllEntry;
+} SMP_RANDOMIZE_DLLNODE, *PSMP_RANDOMIZE_DLLNODE;
 
 /* EXTERNALS ******************************************************************/
 

@@ -6,15 +6,25 @@
  */
 
 /*
- * This ASLR implementation is very basic, according to "Windows Internals".
- * See "Windows Internals" 7th Part1
- *   -> Chapter 5 Memory management,
- *   -> Virtual address space layouts,
- *   -> User address space layout,
- *   -> Image randomization
+ * This ASLR implementation is very basic, mainly according to "Windows Internals".
+ * 
+ * See also:
+ *   "Windows Internals" 7th Part1
+ *     -> Chapter 5 Memory management
+ *       -> Virtual address space layouts
+ *         -> User address space layout
+ *           -> Image randomization
  *
  * 7th "Windows Internals" is referenced but this implementation is more closer to NT6.0,
  * which has nothing to do with ExGenRandom, CFG, ...
+ *
+ * See also:
+ *   https://www.blackhat.com/presentations/bh-usa-08/Sotirov_Dowd/bh08-sotirov-dowd.pdf
+ *     -> Part 1. Memory protection mechanisms in Windows
+ *       -> ASLR
+ *         -> Image randomization
+ *         -> Executable randomization
+ *         -> DLL randomization
  *
  * See also:
  *   https://bbs.kanxue.com/thread-208278.htm
