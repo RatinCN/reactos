@@ -4431,6 +4431,13 @@ RtlRandom(
     _Inout_ PULONG Seed
 );
 
+_Ret_range_(< , MAXLONG)
+NTSYSAPI
+ULONG
+NTAPI
+RtlRandomEx(
+    _Inout_ PULONG Seed);
+
 NTSYSAPI
 ULONG
 NTAPI
