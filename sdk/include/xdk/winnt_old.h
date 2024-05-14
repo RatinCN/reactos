@@ -4520,6 +4520,15 @@ typedef struct _TP_CALLBACK_ENVIRON_V1 {
 } TP_CALLBACK_ENVIRON_V1, TP_CALLBACK_ENVIRON, *PTP_CALLBACK_ENVIRON;
 #endif /* (_WIN32_WINNT >= _WIN32_WINNT_WIN7) */
 
+/*
+ * FIXME: Some platforms have no TSC, may be backed by QPC.
+ * e.g. _ReadStatusReg(ARM64_PMCCNTR_EL0) for ARM64.
+ * Adapt them case-by-case.
+ */
+#if defined(_X86_) || defined(_X64_)
+#define ReadTimeStampCounter() __rdtsc()
+#endif
+
 #ifdef __WINESRC__
 # define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif

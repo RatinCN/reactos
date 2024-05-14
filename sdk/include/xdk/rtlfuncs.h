@@ -3673,3 +3673,16 @@ $if (_NTIFS_)
 #define RtlOffsetToPointer(B,O) ((PCHAR)(((PCHAR)(B)) + ((ULONG_PTR)(O))))
 #define RtlPointerToOffset(B,P) ((ULONG)(((PCHAR)(P)) - ((PCHAR)(B))))
 $endif (_NTIFS_)
+
+$if (_WDMDDK_ || _NTDDK_)
+
+/*
+ * FIXME: Some platforms have no TSC, may be backed by QPC.
+ * e.g. _ReadStatusReg(ARM64_PMCCNTR_EL0) for ARM64.
+ * Adapt them case-by-case.
+ */
+#if defined(_X86_) || defined(_X64_)
+#define ReadTimeStampCounter() __rdtsc()
+#endif
+
+$endif (_WDMDDK_ || _NTDDK_)

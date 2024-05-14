@@ -7,18 +7,18 @@
 
 /*
  * This ASLR implementation is very basic, mainly according to "Windows Internals".
- * 
+ * 7th "Windows Internals" is referenced but this implementation is more closer to NT6.0,
+ * randomized image base address only, without Wow64 support and features
+ * on NT6.2 (large address, force ASLR, ...), NT10 (ExGenRandom, CFG, ...)
+ *
  * See also:
+ * 
  *   "Windows Internals" 7th Part1
  *     -> Chapter 5 Memory management
  *       -> Virtual address space layouts
  *         -> User address space layout
  *           -> Image randomization
  *
- * 7th "Windows Internals" is referenced but this implementation is more closer to NT6.0,
- * which has nothing to do with ExGenRandom, CFG, ...
- *
- * See also:
  *   https://www.blackhat.com/presentations/bh-usa-08/Sotirov_Dowd/bh08-sotirov-dowd.pdf
  *     -> Part 1. Memory protection mechanisms in Windows
  *       -> ASLR
@@ -26,14 +26,19 @@
  *         -> Executable randomization
  *         -> DLL randomization
  *
- * See also:
  *   https://bbs.kanxue.com/thread-208278.htm
+ *   https://bbs.kanxue.com/thread-206911.htm
  */
 
 #include <ntoskrnl.h>
 
 #define NDEBUG
 #include <debug.h>
+
+#include "ARM3/miarm.h"
+
+/* Make sure memory allocation granularity is always 64KB */
+_STATIC_ASSERT(MM_ALLOCATION_GRANULARITY == _64K);
 
 /*
  * Reserved address range for system is different on 32-bit and 64-bit:
@@ -57,16 +62,20 @@
 #endif
 
 /*
- * TODO: Default is TRUE but should be read from registry,
+ * TODO: Should be read from registry.
  *   Key: HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management
  *   Value: MoveImages (REG_DWORD)
+ *     0: Never randomize images.
+ *     0xFFFFFFFF: Force randomize all relocatable image.
+ *     Other (default): Randomize images that have IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE flag.
  */
-static ULONG MmMoveImages = TRUE;
+static ULONG MmMoveImages = 1;
 
 /*
  * ASLR reserved a region for system DLLs,
  * The top of region is MiImageBitMapHighVa,
- * and the size of region depends on the number of units of allocation MiImageBitMap could track.
+ * and the size of region depends on the number of
+ * units of allocation (64K) MiImageBitMap could track.
  * The first DLL base depends on MiImageBias, see "Windows Internals":
  *   This value corresponds to the TSC of the current CPU
  *   when this function was called during the boot cycle,
@@ -75,29 +84,26 @@ static ULONG MmMoveImages = TRUE;
  *   similar computations are done for 64-bit systems with more possible values
  *   as the address space is vast.
  */
-static ULONG MiImageBitMapHighVa;
+static PVOID MiImageBitMapHighVa;
 static RTL_BITMAP MiImageBitMap;
 static ULONG MiImageBias;
 
-VOID NTAPI MiInitializeRelocations()
+CODE_SEG("INIT")
+VOID
+NTAPI
+MiInitializeRelocations(VOID)
 {
     PVOID Buffer;
-
-    /* TODO: ASLR for 64-bit */
-#if defined(_WIN64)
-    DPRINT1("ASLR: Not support 64-bit yet...\n");
-    goto Fail;
-#endif
 
     /* Exit if ASLR is disabled */
     if (!MmMoveImages)
     {
-        DPRINT1("ASLR: ASLR is disabled by configuration.\n");
+        DPRINT1("ASLR: Disabled by configuration.\n");
         return;
     }
 
-    /* Initialize bitmap for 32-bit */
-    MiImageBitMapHighVa = (ULONG_PTR)MI_ASLR_HIGHEST_SYSTEM_RANGE_ADDRESS;
+    /* Initialize bitmap */
+    MiImageBitMapHighVa = MI_ASLR_HIGHEST_SYSTEM_RANGE_ADDRESS;
     Buffer = ExAllocatePoolWithTag(NonPagedPool, MI_ASLR_BITMAP_SIZE_IN_BYTES, TAG_MM);
     if (Buffer == NULL)
     {
@@ -107,21 +113,14 @@ VOID NTAPI MiInitializeRelocations()
     RtlInitializeBitMap(&MiImageBitMap, Buffer, MI_ASLR_BITMAP_SIZE_IN_BYTES * CHAR_BIT);
     RtlClearAllBits(&MiImageBitMap);
 
-    /* FIXME: What if CPU has no __rdtsc()? */
-#if defined(_M_IX86) || defined(_M_X64)
-    MiImageBias = (__rdtsc() >> 4) & 0xFF;
-#else
-    static ULONG RandSeed = 0;
-    MiImageBias = (RtlRandomEx(&RandSeed) >> 4) & 0xFF;
-    DPRINT1("ASLR: FIXME: __rdtsc is not supported, use RtlRandomEx instead.\n");
-#endif
-
+    /* Initialize random bias */
+    MiImageBias = (ReadTimeStampCounter() >> 4) & 0xFF;
     DPRINT1("ASLR: Initialization succeeded, MiImageBitMapHighVa = 0x%p, MiImageBias = %lu.\n",
-            (PVOID)(ULONG_PTR)MiImageBitMapHighVa,
+            MiImageBitMapHighVa,
             MiImageBias);
     return;
 
 Fail:
-    MmMoveImages = FALSE;
-    DPRINT1("ASLR: ASLR initialization failed.\n");
+    MmMoveImages = 0;
+    DPRINT1("ASLR: Initialization failed.\n");
 }

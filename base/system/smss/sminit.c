@@ -1429,13 +1429,12 @@ SmpSortDllList(const ULONG* Rand1, const ULONG* Rand2)
     return *Rand1 - *Rand2;
 }
 
+static
 NTSTATUS
 NTAPI
 SmpRandomizeDllList(
     _In_ PLIST_ENTRY DllList,
-    _Out_
-    _When_(NumberOfDlls == 0, *RandomizedDlls == NULL)
-    _At_(*RandomizedDlls, _Post_readable_size_(*NumberOfDlls))
+    _Out_ _At_(*RandomizedDlls, _Readable_elements_(*NumberOfDlls))
     PSMP_RANDOMIZE_DLLNODE* RandomizedDlls,
     _Inout_ PULONG NumberOfDlls)
 {
@@ -1455,14 +1454,7 @@ SmpRandomizeDllList(
     /* Initialize random seed */
     if (RandomizeDllListSeed == 0)
     {
-        /* FIXME: What if CPU has no __rdtsc()? */
-#if defined(_M_IX86) || defined(_M_X64)
-        RandomizeDllListSeed = (ULONG)__rdtsc();
-#else
-        static ULONG RandSeed = 0;
-        RandomizeDllListSeed = RtlRandomEx(&RandSeed);
-        DPRINT1("ASLR: FIXME: __rdtsc is not supported, use RtlRandomEx instead.\n");
-#endif
+        RandomizeDllListSeed = (ULONG)ReadTimeStampCounter();
         if (RandomizeDllListSeed == 0)
         {
             Status = NtQueryInformationProcess(NtCurrentProcess(),
@@ -1522,7 +1514,7 @@ SmpInitializeKnownDllsInternal(IN PUNICODE_STRING Directory,
     UNICODE_STRING NtPath, SymLinkName;
     OBJECT_ATTRIBUTES ObjectAttributes;
     NTSTATUS Status, Status1;
-    PSMP_RANDOMIZE_DLLNODE RandomizedDllNode;
+    PSMP_RANDOMIZE_DLLNODE RandomizedDllNodes;
     ULONG i, DllNodeCount;
     PSMP_REGISTRY_VALUE RegEntry;
     ULONG_PTR ErrorParameters[3];
@@ -1623,7 +1615,7 @@ SmpInitializeKnownDllsInternal(IN PUNICODE_STRING Directory,
 
     /* Now loop the known DLLs */
     DllNodeCount = 0;
-    Status = SmpRandomizeDllList(&SmpKnownDllsList, &RandomizedDllNode, &DllNodeCount);
+    Status = SmpRandomizeDllList(&SmpKnownDllsList, &RandomizedDllNodes, &DllNodeCount);
     if (!NT_SUCCESS(Status))
     {
         goto Quickie;
@@ -1631,11 +1623,11 @@ SmpInitializeKnownDllsInternal(IN PUNICODE_STRING Directory,
     for (i = 0; i < DllNodeCount; i++)
     {
         /* Get the entry */
-        RegEntry = (PSMP_REGISTRY_VALUE)RandomizedDllNode[i].DllEntry;
-        DPRINT1("ASLR: Processing known DLL: %wZ-%wZ Random: %lu\n",
+        RegEntry = (PSMP_REGISTRY_VALUE)RandomizedDllNodes[i].DllEntry;
+        DPRINT1("ASLR: Processing known DLL: Random: 0x%08lX Name: %wZ Value: %wZ\n",
+                RandomizedDllNodes[i].Random,
                 &RegEntry->Name,
-                &RegEntry->Value,
-                RandomizedDllNode[i].Random);
+                &RegEntry->Value);
 
         /* Skip the entry if it's in the excluded list */
         if ((SmpFindRegistryValue(&SmpExcludeKnownDllsList,
@@ -1730,7 +1722,7 @@ SmpInitializeKnownDllsInternal(IN PUNICODE_STRING Directory,
         Status1 = NtClose(FileHandle);
         ASSERT(NT_SUCCESS(Status1));
     }
-    RtlFreeHeap(RtlGetProcessHeap(), 0, RandomizedDllNode);
+    RtlFreeHeap(RtlGetProcessHeap(), 0, RandomizedDllNodes);
 
 Quickie:
     /* Close both handles and free the NT path buffer */

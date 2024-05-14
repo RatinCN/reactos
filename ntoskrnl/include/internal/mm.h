@@ -1812,7 +1812,7 @@ MiInitializeWorkingSetList(_Inout_ PMMSUPPORT WorkingSet);
 
 VOID
 NTAPI
-MiInitializeRelocations();
+MiInitializeRelocations(VOID);
 
 #ifdef __cplusplus
 } // extern "C"

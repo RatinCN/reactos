@@ -196,7 +196,7 @@ PsLocateSystemDll(VOID)
     /* Locate and open NTDLL to determine ImageBase and LdrStartup */
     InitializeObjectAttributes(&ObjectAttributes,
                                &PsNtDllPathName,
-                               0,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL,
                                NULL);
     Status = ZwOpenFile(&FileHandle,
