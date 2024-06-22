@@ -3113,9 +3113,9 @@ ExeFmtpCreateImageSection(PFILE_OBJECT FileObject,
     if(ImageSectionObject->BasedAddress == NULL)
     {
         if(ImageSectionObject->ImageInformation.ImageCharacteristics & IMAGE_FILE_DLL)
-            ImageSectionObject->BasedAddress = (PVOID)0x10000000;
+            ImageSectionObject->BasedAddress = (PVOID)MI_DEFAULT_BASE_DLL;
         else
-            ImageSectionObject->BasedAddress = (PVOID)0x00400000;
+            ImageSectionObject->BasedAddress = (PVOID)MI_DEFAULT_BASE_EXE;
     }
 
     /*

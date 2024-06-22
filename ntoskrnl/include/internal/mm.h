@@ -79,6 +79,14 @@ typedef ULONG_PTR SWAPENTRY;
 #define MMDBG_COPY_UNCACHED         0x00000010
 #define MMDBG_COPY_WRITE_COMBINED   0x00000020
 
+#ifdef _WIN64
+#define MI_DEFAULT_BASE_EXE 0x140000000
+#define MI_DEFAULT_BASE_DLL 0x180000000
+#else
+#define MI_DEFAULT_BASE_EXE 0x00400000
+#define MI_DEFAULT_BASE_DLL 0x10000000
+#endif
+
 //
 // Maximum chunk size per copy
 //
