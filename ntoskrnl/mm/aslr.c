@@ -25,9 +25,6 @@
  *         -> Image randomization
  *         -> Executable randomization
  *         -> DLL randomization
- *
- *   https://bbs.kanxue.com/thread-208278.htm
- *   https://bbs.kanxue.com/thread-206911.htm
  */
 
 #include <ntoskrnl.h>
