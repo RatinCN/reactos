@@ -22,6 +22,8 @@ extern "C" {
 /* Everyone loves 64K */
 #define _64K (64 * _1KB)
 
+#define _4GB (0x100000000ULL)
+
 /* Size of a page table */
 #define PT_SIZE  (PTE_PER_PAGE * sizeof(MMPTE))
 

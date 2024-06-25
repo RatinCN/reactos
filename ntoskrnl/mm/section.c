@@ -3170,6 +3170,14 @@ ExeFmtpCreateImageSection(PFILE_OBJECT FileObject,
     ImageSectionObject->FileObject = FileObject;
 
     ASSERT(NT_SUCCESS(Status));
+
+    /* Hack for ASLR */
+    ImageSectionObject->AslrBaseAddress = NULL;
+    if (NT_SUCCESS(Status))
+    {
+        MiRosRelocateImage(ImageSectionObject);
+    }
+
     return Status;
 }
 
@@ -4068,7 +4076,14 @@ MmMapViewOfSection(IN PVOID SectionObject,
         ImageBase = (ULONG_PTR)*BaseAddress;
         if (ImageBase == 0)
         {
-            ImageBase = (ULONG_PTR)ImageSectionObject->BasedAddress;
+            ImageBase = (ULONG_PTR)ImageSectionObject->AslrBaseAddress;
+            if (ImageBase == 0)
+            {
+                ImageBase = (ULONG_PTR)ImageSectionObject->BasedAddress;
+            } else
+            {
+                NotAtBase = ImageBase != (ULONG_PTR)ImageSectionObject->BasedAddress;
+            }
         }
 
         ImageSize = 0;

@@ -12,7 +12,7 @@
  * on NT6.2 (large address, force ASLR, ...), NT10 (ExGenRandom, CFG, ...)
  *
  * See also:
- * 
+ *
  *   "Windows Internals" 7th Part1
  *     -> Chapter 5 Memory management
  *       -> Virtual address space layouts
@@ -88,6 +88,8 @@ static PVOID MiImageBitMapHighVa;
 static RTL_BITMAP MiImageBitMap;
 static ULONG MiImageBias;
 
+static KSPIN_LOCK MiRelocationVaLock;
+
 CODE_SEG("INIT")
 VOID
 NTAPI
@@ -103,6 +105,7 @@ MiInitializeRelocations(VOID)
     }
 
     /* Initialize bitmap */
+    KeInitializeSpinLock(&MiRelocationVaLock);
     MiImageBitMapHighVa = MI_ASLR_HIGHEST_SYSTEM_RANGE_ADDRESS;
     Buffer = ExAllocatePoolWithTag(NonPagedPool, MI_ASLR_BITMAP_SIZE_IN_BYTES, TAG_MM);
     if (Buffer == NULL)
@@ -123,4 +126,182 @@ MiInitializeRelocations(VOID)
 Fail:
     MmMoveImages = 0;
     DPRINT1("ASLR: Initialization failed.\n");
+}
+
+/*
+ * FIXME: a bit hacky.
+ * Very similar to MiSelectImageBase, which has PSEGMENT parameter.
+ * This implementation has PMM_IMAGE_SECTION_OBJECT parameter instead.
+ */
+static
+PVOID
+NTAPI
+MiRosSelectImageBase(
+    _Inout_ PMM_IMAGE_SECTION_OBJECT ImageSectionObject)
+{
+    ULONG_PTR ImageSize;
+    USHORT NumberOf64kChunks;
+    BOOLEAN UseImageBitMap;
+    PVOID SelectedBase;
+    KIRQL OldIrql;
+    ULONG BitIndex, StartBit, EndBit;
+    ULONG_PTR Delta, RelocateDelta;
+
+#if defined(_WIN64)
+    // if (Segment->BasedAddress < (ULONG_PTR)_4GB)
+    if (ImageSectionObject->BasedAddress < (ULONG_PTR)_4GB)
+    {
+        // TODO
+        FIXME("FIXME: Base address < 4GB on 64-bit is not implemented!");
+        return NULL;
+    }
+    else
+    {
+        // ASLRInfo->BitMap64 = TRUE;
+    }
+#else
+    // ASLRInfo->BitMap64 = FALSE;
+#endif
+
+    // ImageSize = ROUND_TO_ALLOCATION_GRANULARITY(Segment->TotalNumberOfPtes * PAGE_SIZE);
+    ImageSize = ROUND_TO_ALLOCATION_GRANULARITY(ImageSectionObject->ImageInformation.ImageFileSize);
+    NumberOf64kChunks = ImageSize / MM_ALLOCATION_GRANULARITY;
+
+    /* Image bitmap for DLL only, not for EXE */
+    UseImageBitMap = TRUE;
+    // if (!FlagOn(Segment->u2.ImageInformation->ImageCharacteristics, IMAGE_FILE_DLL))
+    if (!FlagOn(ImageSectionObject->ImageInformation.ImageCharacteristics, IMAGE_FILE_DLL))
+    {
+        UseImageBitMap = FALSE;
+    }
+
+    /* And also don't use image bitmap when it's unavailable */
+    BitIndex = RtlFindClearBits(&MiImageBitMap, NumberOf64kChunks, MiImageBias);
+    if (BitIndex == 0xFFFFFFFF)
+    {
+        UseImageBitMap = FALSE;
+    }
+    OldIrql = KeAcquireSpinLockRaiseToSynch(&MiRelocationVaLock);
+    StartBit = RtlFindClearBitsAndSet(&MiImageBitMap, NumberOf64kChunks, BitIndex);
+    KeReleaseSpinLock(&MiRelocationVaLock, OldIrql);
+    if (StartBit == 0xFFFFFFFF)
+    {
+        UseImageBitMap = FALSE;
+    }
+
+    if (UseImageBitMap)
+    {
+        /* Select image base in image bitmap, typically for DLL */
+        EndBit = StartBit + NumberOf64kChunks;
+        SelectedBase = (PCHAR)MiImageBitMapHighVa - (EndBit * MM_ALLOCATION_GRANULARITY);
+        // if (SelectedBase == Segment->BasedAddress)
+        if (SelectedBase == ImageSectionObject->BasedAddress)
+        {
+            /* Re-select if selected base is the same as image base */
+            OldIrql = KeAcquireSpinLockRaiseToSynch(&MiRelocationVaLock);
+            BitIndex = RtlFindClearBitsAndSet(&MiImageBitMap, NumberOf64kChunks, EndBit);
+            if (BitIndex != 0xFFFFFFFF)
+            {
+                RtlClearBits(&MiImageBitMap, StartBit, NumberOf64kChunks);
+            }
+            KeReleaseSpinLock(&MiRelocationVaLock, OldIrql);
+
+            /* Use new base if re-select successfully */
+            if (BitIndex != 0xFFFFFFFF)
+            {
+                StartBit = BitIndex;
+                EndBit = StartBit + NumberOf64kChunks;
+                SelectedBase = (PCHAR)MiImageBitMapHighVa - (EndBit * MM_ALLOCATION_GRANULARITY);
+            }
+        }
+    }
+    else
+    {
+        /* Select image base not use image bitmap, typically for EXE */
+
+        // RelocateDelta = (ULONG_PTR)Segment->BasedAddress - (ULONG_PTR)ASLRInfo->OriginalBase;
+        RelocateDelta = 0; // FIXME
+        if (RelocateDelta > (ULONG_PTR)MmHighestUserAddress ||
+            ImageSize > (ULONG_PTR)MmHighestUserAddress ||
+            RelocateDelta + ImageSize <= RelocateDelta ||
+            RelocateDelta + ImageSize > (ULONG_PTR)MmHighestUserAddress)
+        {
+            return NULL;
+        }
+
+        /*
+         * See "Windows Internals":
+         *   For executables, the load offset is calculated by computing a delta value each time
+         *   an executable is loaded. This value is a pseudo-random 8-bit number
+         *   from 0x10000 to 0xFE0000, calculated by taking he current processor’s
+         *   time stamp counter (TSC), shifting it by four places, and then performing a division
+         *   modulo 254 and adding 1. This number is then multiplied by the allocation granularity
+         *   of 64 KB discussed earlier.
+         */
+        Delta = (ULONG_PTR)((ReadTimeStampCounter() >> 4) % 254 + 1) * MM_ALLOCATION_GRANULARITY;
+        // if (Add2Ptr(ASLRInfo->OriginalBase, Delta) == NULL)
+        if (Add2Ptr(ImageSectionObject->BasedAddress, Delta) == NULL)
+        {
+            SelectedBase = ImageSectionObject->BasedAddress;
+        }
+        else if (RelocateDelta > Delta)
+        {
+            SelectedBase = (PVOID)(RelocateDelta - Delta);
+        }
+        else
+        {
+            SelectedBase = (PVOID)(RelocateDelta + Delta);
+            if (SelectedBase < (PVOID)RelocateDelta ||
+                Add2Ptr(SelectedBase, ImageSize) > MmHighestUserAddress ||
+                // Add2Ptr(SelectedBase, ImageSize) < Add2Ptr(Segment->BasedAddress, ImageSize))
+                Add2Ptr(SelectedBase, ImageSize) < Add2Ptr(ImageSectionObject->BasedAddress, ImageSize))
+            {
+                return NULL;
+            }
+        }
+        StartBit = 0xFFFFFFFF;
+    }
+    // ASLRInfo->ImageRelocationStartBit = StartBit;
+    // ASLRInfo->ImageRelocationSizeIn64k = NumberOf64kChunks;
+    return SelectedBase;
+}
+
+/*
+ * FIXME: Totally hacky.
+ */
+PVOID
+NTAPI
+MiRosRelocateImage(
+    _Inout_ PMM_IMAGE_SECTION_OBJECT ImageSectionObject)
+{
+    /* Shall we ASLR this image? */
+    if (ImageSectionObject->ImageInformation.ImageCharacteristics & IMAGE_FILE_DLL)
+    {
+        /* Don't ASLR kernel mode modules, that's KASLR */
+        if (ImageSectionObject->ImageInformation.SubSystemType != IMAGE_SUBSYSTEM_WINDOWS_GUI &&
+            ImageSectionObject->ImageInformation.SubSystemType != IMAGE_SUBSYSTEM_WINDOWS_CUI)
+        {
+            return NULL;
+        }
+
+        /* Hack: Don't ASLR DLLs intend to have a fixed base address (for ntdll, kernel32, user32. WIP) */
+        if (ImageSectionObject->BasedAddress != (PVOID)MI_DEFAULT_BASE_DLL)
+        {
+            return NULL;
+        }
+
+        /* FIXME: WIP: How do we recognize system DLLs to ASLR? For Known-DLLs loaded by smss.exe only? */
+    }
+    else
+    {
+        /* Don't ASLR EXE, WIP */
+        return NULL;
+    }
+
+    ImageSectionObject->AslrBaseAddress = MiRosSelectImageBase(ImageSectionObject);
+    DPRINT1("ASLR: New section created for %wZ, PE base: 0x%p, ASLR base: 0x%p\n",
+            &ImageSectionObject->FileObject->FileName,
+            ImageSectionObject->BasedAddress,
+            ImageSectionObject->AslrBaseAddress);
+    return ImageSectionObject->AslrBaseAddress;
 }

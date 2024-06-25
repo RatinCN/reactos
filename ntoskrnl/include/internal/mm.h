@@ -240,6 +240,9 @@ typedef struct _MM_IMAGE_SECTION_OBJECT
     PVOID BasedAddress;
     ULONG NrSegments;
     PMM_SECTION_SEGMENT Segments;
+
+    /* Hack for ASLR */
+    PVOID AslrBaseAddress;
 } MM_IMAGE_SECTION_OBJECT, *PMM_IMAGE_SECTION_OBJECT;
 
 #define MM_PHYSICALMEMORY_SEGMENT           (0x1)
@@ -1821,6 +1824,11 @@ MiInitializeWorkingSetList(_Inout_ PMMSUPPORT WorkingSet);
 VOID
 NTAPI
 MiInitializeRelocations(VOID);
+
+PVOID
+NTAPI
+MiRosRelocateImage(
+    _Inout_ PMM_IMAGE_SECTION_OBJECT ImageSectionObject);
 
 #ifdef __cplusplus
 } // extern "C"
