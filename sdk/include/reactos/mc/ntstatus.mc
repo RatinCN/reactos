@@ -17,6 +17,7 @@ FIREWIRE=0x12:FACILITY_FIREWIRE_ERROR_CODE
 Cluster=0x13:FACILITY_CLUSTER_ERROR_CODE
 ACPI=0x14:FACILITY_ACPI_ERROR_CODE
 SXS=0x15:FACILITY_SXS_ERROR_CODE
+Transaction=0x19:FACILITY_TRANSACTION
 )
 LanguageNames=(English=0x409:MSG00409)
 
@@ -5747,4 +5748,12 @@ Facility=SXS
 SymbolicName=STATUS_SXS_PROCESS_TERMINATION_REQUESTED
 Language=English
 A component used by the isolation facility has requested to terminate the process.
+.
+
+MessageId=0x1
+Severity=Error
+Facility=Transaction
+SymbolicName=STATUS_TRANSACTIONAL_CONFLICT
+Language=English
+The function attempted to use a name that is reserved for use by another transaction.
 .
