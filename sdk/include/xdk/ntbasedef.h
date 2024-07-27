@@ -106,8 +106,10 @@
 /* Returns the byte offset of the specified structure's member */
 #if !defined(__GNUC__) && !defined(__clang__)
  #define FIELD_OFFSET(Type, Field) ((LONG)(LONG_PTR)&(((Type*) 0)->Field))
+ #define UFIELD_OFFSET(Type, Field) ((ULONG)(LONG_PTR)&(((Type*)0)->Field))
 #else
  #define FIELD_OFFSET(Type, Field) ((LONG)__builtin_offsetof(Type, Field))
+ #define UFIELD_OFFSET(Type, Field) ((ULONG)__builtin_offsetof(Type, Field))
 #endif /* __GNUC__ */
 
 /* Returns the type's alignment */
