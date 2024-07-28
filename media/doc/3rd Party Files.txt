@@ -306,3 +306,9 @@ Path: sdk/include/ddk/d3dkmthk.h
 Used Version: git commit 045831e
 License: MIT (https://spdx.org/licenses/MIT.html)
 URL: https://github.com/microsoft/libdxg
+
+Title: SlimDetours
+Path: sdk/lib/3rdparty/SlimDetours
+Used Version: git commit d0d83130
+License: MIT (https://spdx.org/licenses/MIT.html)
+URL: https://github.com/KNSoft/KNSoft.SlimDetours
