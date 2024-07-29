@@ -50,6 +50,7 @@ list(APPEND SOURCE
     SHGetUserDisplayName.cpp
     SHLimitInputEdit.cpp
     SHSetUnreadMailCountW.cpp
+    SlimDetoursExample.cpp
     StrRStr.cpp
     menu.cpp
     shelltest.cpp)
@@ -68,7 +69,7 @@ set_target_properties(shell32_apitest
     ENABLE_EXPORTS TRUE
     DEFINE_SYMBOL "")
 
-target_link_libraries(shell32_apitest wine uuid ${PSEH_LIB} cpprt atl_classes)
+target_link_libraries(shell32_apitest wine uuid ${PSEH_LIB} cpprt atl_classes SlimDetours)
 set_module_type(shell32_apitest win32cui)
 target_compile_definitions(shell32_apitest PRIVATE UNICODE _UNICODE)
 add_importlibs(shell32_apitest user32 gdi32 shell32 shlwapi ole32 oleaut32 advapi32 shlwapi msvcrt kernel32 ntdll)
