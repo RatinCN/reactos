@@ -1,10 +1,182 @@
 ﻿/*
- * KNSoft SlimDetours (https://github.com/KNSoft/SlimDetours) Thread management
+ * KNSoft.SlimDetours (https://github.com/KNSoft/KNSoft.SlimDetours) Thread management
  * Copyright (c) KNSoft.org (https://github.com/KNSoft). All rights reserved.
  * Licensed under the MIT license.
  */
 
 #include "SlimDetours.inl"
+
+static HANDLE s_Handles[32];
+
+#if _WIN32_WINNT >= _WIN32_WINNT_WIN6
+
+static BOOL g_CurrentThreadSkipped = FALSE;
+static HANDLE g_PrevThreadHandle = NULL;
+
+static
+NTSTATUS
+detour_suspend_next_thread(
+    _Out_ PHANDLE NextThreadHandle)
+{
+    NTSTATUS Status;
+    THREAD_BASIC_INFORMATION TBI;
+    BOOL ClosePrevThread = FALSE;
+
+_Next_thread:
+    /* Get next thread */
+    Status = NtGetNextThread(NtCurrentProcess(),
+                             g_PrevThreadHandle,
+                             THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                             0,
+                             0,
+                             NextThreadHandle);
+    if (ClosePrevThread)
+    {
+        NtClose(g_PrevThreadHandle);
+    }
+    if (!NT_SUCCESS(Status))
+    {
+        if (Status == STATUS_NO_MORE_ENTRIES)
+        {
+            *NextThreadHandle = NULL;
+            Status = STATUS_SUCCESS;
+            goto _Exit;
+        }
+        return Status;
+    }
+
+    /* Skip current thread */
+    if (g_CurrentThreadSkipped)
+    {
+        goto _Suspend_thread;
+    }
+    /* False positive warning, *NextThreadHandle should be already assigned */
+#pragma warning(disable: __WARNING_USING_UNINIT_VAR)
+    Status = NtQueryInformationThread(*NextThreadHandle, ThreadBasicInformation, &TBI, sizeof(TBI), NULL);
+#pragma warning(default: __WARNING_USING_UNINIT_VAR)
+    if (!NT_SUCCESS(Status))
+    {
+        NtClose(*NextThreadHandle);
+        goto _Exit;
+    }
+    if (TBI.ClientId.UniqueThread == NtCurrentThreadId())
+    {
+        g_CurrentThreadSkipped = TRUE;
+        goto _Step_next;
+    }
+
+_Suspend_thread:
+    if (NT_SUCCESS(NtSuspendThread(*NextThreadHandle, NULL)))
+    {
+        g_PrevThreadHandle = *NextThreadHandle;
+        return STATUS_SUCCESS;
+    }
+_Step_next:
+    g_PrevThreadHandle = *NextThreadHandle;
+    ClosePrevThread = TRUE;
+    goto _Next_thread;
+
+_Exit:
+    g_PrevThreadHandle = NULL;
+    g_CurrentThreadSkipped = FALSE;
+    return Status;
+
+}
+
+#else
+
+static PSYSTEM_PROCESS_INFORMATION g_SPI = NULL;
+static PSYSTEM_THREAD_INFORMATION g_STI;
+static ULONG g_ThreadCount;
+static OBJECT_ATTRIBUTES g_EmptyObjectAttributes = RTL_CONSTANT_OBJECT_ATTRIBUTES(NULL, 0);
+
+static
+NTSTATUS
+detour_suspend_next_thread(
+    _Out_ PHANDLE ThreadHandle)
+{
+    NTSTATUS Status;
+    ULONG i;
+    PSYSTEM_PROCESS_INFORMATION pSPI;
+    PSYSTEM_THREAD_INFORMATION pSTI;
+
+    if (g_SPI == NULL)
+    {
+        /* Get system process and thread information */
+        i = _1MB;
+_Try_alloc:
+        g_SPI = (PSYSTEM_PROCESS_INFORMATION)detour_memory_alloc(i);
+        if (g_SPI == NULL)
+        {
+            return STATUS_NO_MEMORY;
+        }
+        Status = NtQuerySystemInformation(SystemProcessInformation, g_SPI, i, &i);
+        if (!NT_SUCCESS(Status))
+        {
+            detour_memory_free(g_SPI);
+            if (Status == STATUS_INFO_LENGTH_MISMATCH)
+            {
+                goto _Try_alloc;
+            }
+            g_SPI = NULL;
+            return Status;
+        }
+
+        /* Find current process and threads */
+        pSPI = g_SPI;
+        while (pSPI->UniqueProcessId != NtCurrentProcessId())
+        {
+            if (pSPI->NextEntryOffset == 0)
+            {
+                detour_memory_free(g_SPI);
+                g_SPI = NULL;
+                return STATUS_NOT_FOUND;
+            }
+            pSPI = (PSYSTEM_PROCESS_INFORMATION)Add2Ptr(pSPI, pSPI->NextEntryOffset);
+        }
+        g_ThreadCount = pSPI->NumberOfThreads;
+        pSTI = (PSYSTEM_THREAD_INFORMATION)Add2Ptr(pSPI, sizeof(*pSPI));
+    } else
+    {
+        pSTI = g_STI + 1;
+    }
+    if (g_ThreadCount == 0)
+    {
+        goto _No_more_thread;
+    }
+
+_Suspend_thread:
+    /* Open and suspend thread, skip current thread */
+    if (pSTI->ClientId.UniqueThread != NtCurrentThreadId() &&
+        NT_SUCCESS(NtOpenThread(ThreadHandle,
+                                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                                &g_EmptyObjectAttributes,
+                                &pSTI->ClientId)))
+    {
+        if (NT_SUCCESS(NtSuspendThread(*ThreadHandle, NULL)))
+        {
+            g_STI = pSTI;
+            return STATUS_SUCCESS;
+        } else
+        {
+            NtClose(*ThreadHandle);
+        }
+    }
+
+    g_ThreadCount--;
+    if (g_ThreadCount)
+    {
+        pSTI += 1;
+        goto _Suspend_thread;
+    }
+_No_more_thread:
+    *ThreadHandle = NULL;
+    detour_memory_free(g_SPI);
+    g_SPI = NULL;
+    return STATUS_SUCCESS;
+}
+
+#endif
 
 NTSTATUS
 detour_thread_suspend(
@@ -12,101 +184,79 @@ detour_thread_suspend(
     _Out_ PULONG SuspendedHandleCount)
 {
     NTSTATUS Status;
-    ULONG i, ThreadCount, SuspendedCount;
-    PSYSTEM_PROCESS_INFORMATION pSPI, pCurrentSPI;
-    PSYSTEM_THREAD_INFORMATION pSTI;
-    PHANDLE Buffer;
-    HANDLE ThreadHandle, CurrentPID, CurrentTID;
-    OBJECT_ATTRIBUTES ObjectAttributes = RTL_CONSTANT_OBJECT_ATTRIBUTES(NULL, 0);
+    PHANDLE Buffer = s_Handles;
+    ULONG BufferCapacity = ARRAYSIZE(s_Handles);
+    ULONG SuspendedCount = 0;
+    HANDLE ThreadHandle;
 
-    /* Get system process and thread information */
-    i = _1MB;
-_Try_alloc:
-    pSPI = (PSYSTEM_PROCESS_INFORMATION)detour_memory_alloc(i);
-    if (pSPI == NULL)
-    {
-        return STATUS_NO_MEMORY;
-    }
-    Status = NtQuerySystemInformation(SystemProcessInformation, pSPI, i, &i);
+    /* Suspend next thread and get handle */
+_Suspend_next_thread:
+    Status = detour_suspend_next_thread(&ThreadHandle);
     if (!NT_SUCCESS(Status))
     {
-        detour_memory_free(pSPI);
-        if (Status == STATUS_INFO_LENGTH_MISMATCH)
-        {
-            goto _Try_alloc;
-        }
-        return Status;
-    }
-
-    /* Find current process and threads */
-    CurrentPID = NtGetCurrentProcessId();
-    pCurrentSPI = pSPI;
-    while (pCurrentSPI->UniqueProcessId != CurrentPID)
+        goto _Fail;
+    } else if (ThreadHandle == NULL)
     {
-        if (pCurrentSPI->NextEntryOffset == 0)
-        {
-            Status = STATUS_NOT_FOUND;
-            goto _Exit;
-        }
-        pCurrentSPI = (PSYSTEM_PROCESS_INFORMATION)Add2Ptr(pCurrentSPI, pCurrentSPI->NextEntryOffset);
-    }
-    pSTI = (PSYSTEM_THREAD_INFORMATION)Add2Ptr(pCurrentSPI, sizeof(*pCurrentSPI));
-
-    /* Skip if no other threads */
-    ThreadCount = pCurrentSPI->NumberOfThreads - 1;
-    if (ThreadCount == 0)
-    {
-        *SuspendedHandles = NULL;
-        *SuspendedHandleCount = 0;
-        Status = STATUS_SUCCESS;
         goto _Exit;
     }
 
-    /* Create handle array */
-    Buffer = (PHANDLE)detour_memory_alloc(ThreadCount * sizeof(HANDLE));
-    if (Buffer == NULL)
+    /* Allocate buffer dynamically if static buffer is insufficient */
+    if (SuspendedCount >= BufferCapacity)
     {
-        Status = STATUS_NO_MEMORY;
-        goto _Exit;
-    }
+        BufferCapacity *= 2;
 
-    /* Suspend threads */
-    SuspendedCount = 0;
-    CurrentTID = NtGetCurrentThreadId();
-    for (i = 0; i < pCurrentSPI->NumberOfThreads; i++)
-    {
-        if (pSTI[i].ClientId.UniqueThread == CurrentTID ||
-            !NT_SUCCESS(NtOpenThread(&ThreadHandle,
-                                     THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
-                                     &ObjectAttributes,
-                                     &pSTI[i].ClientId)))
+        PHANDLE p;
+        if (Buffer == s_Handles)
         {
-            continue;
-        }
-        if (NT_SUCCESS(NtSuspendThread(ThreadHandle, NULL)))
-        {
-            _Analysis_assume_(SuspendedCount < ThreadCount);
-            Buffer[SuspendedCount++] = ThreadHandle;
+            p = (PHANDLE)detour_memory_alloc(BufferCapacity * sizeof(HANDLE));
+            if (p)
+            {
+                RtlCopyMemory(p, Buffer, SuspendedCount * sizeof(HANDLE));
+            }
         } else
         {
+            p = (PHANDLE)detour_memory_realloc(Buffer, BufferCapacity * sizeof(HANDLE));
+        }
+
+        if (p)
+        {
+            Buffer = p;
+        } else
+        {
+            Status = STATUS_NO_MEMORY;
+            NtResumeThread(ThreadHandle, NULL);
             NtClose(ThreadHandle);
+            goto _Fail;
         }
     }
 
-    /* Return suspended thread handles */
-    if (SuspendedCount == 0)
+    // Perform a synchronous operation to make sure the thread really is suspended.
+    // https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743
+    CONTEXT cxt;
+    cxt.ContextFlags = CONTEXT_CONTROL;
+    NtGetContextThread(ThreadHandle, &cxt);
+
+    Buffer[SuspendedCount++] = ThreadHandle;
+    goto _Suspend_next_thread;
+
+_Fail:
+    for (UINT i = 0; i < SuspendedCount; ++i)
+    {
+        NtResumeThread(Buffer[i], NULL);
+        NtClose(Buffer[i]);
+    }
+    if (Buffer != s_Handles)
     {
         detour_memory_free(Buffer);
-        *SuspendedHandles = NULL;
-    } else
-    {
-        *SuspendedHandles = Buffer;
     }
-    *SuspendedHandleCount = SuspendedCount;
-    Status = STATUS_SUCCESS;
+
+    Buffer = NULL;
+    SuspendedCount = 0;
 
 _Exit:
-    detour_memory_free(pSPI);
+    *SuspendedHandles = Buffer;
+    *SuspendedHandleCount = SuspendedCount;
+
     return Status;
 }
 
@@ -122,7 +272,11 @@ detour_thread_resume(
         NtResumeThread(SuspendedHandles[i], NULL);
         NtClose(SuspendedHandles[i]);
     }
-    detour_memory_free(SuspendedHandles);
+
+    if (SuspendedHandles != s_Handles)
+    {
+        detour_memory_free(SuspendedHandles);
+    }
 }
 
 NTSTATUS
@@ -135,26 +289,44 @@ detour_thread_update(
     CONTEXT cxt;
     BOOL bUpdateContext;
 
+    /*
+     * Work-around an issue in Arm64 (and Arm64EC) in which LR and FP registers may become zeroed
+     * when CONTEXT_CONTROL is used without CONTEXT_INTEGER.
+     * 
+     * See also: https://github.com/microsoft/Detours/pull/313
+     */
+#if defined(_AMD64_) || defined(_ARM64_)
+    cxt.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+#else
     cxt.ContextFlags = CONTEXT_CONTROL;
+#endif
+
     Status = NtGetContextThread(ThreadHandle, &cxt);
     if (!NT_SUCCESS(Status))
     {
         return Status;
     }
 
-    for (o = PendingOperations; o != NULL; o = o->pNext)
+    bUpdateContext = FALSE;
+    for (o = PendingOperations; o != NULL && !bUpdateContext; o = o->pNext)
     {
-        bUpdateContext = FALSE;
         if (o->fIsRemove)
         {
-            if (cxt.CONTEXT_PC >= (ULONG_PTR)o->pTrampoline &&
-                cxt.CONTEXT_PC < ((ULONG_PTR)o->pTrampoline + sizeof(o->pTrampoline)))
+            if (cxt.CONTEXT_PC >= (ULONG_PTR)o->pTrampoline->rbCode &&
+                cxt.CONTEXT_PC < ((ULONG_PTR)o->pTrampoline->rbCode + RTL_FIELD_SIZE(DETOUR_TRAMPOLINE, rbCode)))
             {
                 cxt.CONTEXT_PC = (ULONG_PTR)o->pbTarget +
                     detour_align_from_trampoline(o->pTrampoline, (BYTE)(cxt.CONTEXT_PC - (ULONG_PTR)o->pTrampoline));
                 bUpdateContext = TRUE;
             }
-        } else
+#if defined(_X86_) || defined(_AMD64_)
+            else if (cxt.CONTEXT_PC == (ULONG_PTR)o->pTrampoline->rbCodeIn)
+            {
+                cxt.CONTEXT_PC = (ULONG_PTR)o->pbTarget;
+                bUpdateContext = TRUE;
+            }
+#endif
+        } else if (o->fIsAdd)
         {
             if (cxt.CONTEXT_PC >= (ULONG_PTR)o->pbTarget &&
                 cxt.CONTEXT_PC < ((ULONG_PTR)o->pbTarget + o->pTrampoline->cbRestore))
@@ -164,11 +336,11 @@ detour_thread_update(
                 bUpdateContext = TRUE;
             }
         }
-        if (bUpdateContext)
-        {
-            Status = NtSetContextThread(ThreadHandle, &cxt);
-            break;
-        }
+    }
+
+    if (bUpdateContext)
+    {
+        Status = NtSetContextThread(ThreadHandle, &cxt);
     }
 
     return Status;

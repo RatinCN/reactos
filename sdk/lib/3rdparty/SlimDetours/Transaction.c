@@ -1,5 +1,5 @@
 ﻿/*
- * KNSoft SlimDetours (https://github.com/KNSoft/SlimDetours) Transaction APIs
+ * KNSoft.SlimDetours (https://github.com/KNSoft/KNSoft.SlimDetours) Transaction APIs
  * Copyright (c) KNSoft.org (https://github.com/KNSoft). All rights reserved.
  * Licensed under the MIT license.
  *
@@ -12,53 +12,20 @@
 
 #include "SlimDetours.inl"
 
-#if (NTDDI_VERSION >= NTDDI_WIN6)
-
-typedef
-NTSTATUS
-NTAPI
-FN_LdrRegisterDllNotification(
-    _In_ ULONG Flags,
-    _In_ PLDR_DLL_NOTIFICATION_FUNCTION NotificationFunction,
-    _In_opt_ PVOID Context,
-    _Out_ PVOID* Cookie);
-
-typedef struct _DETOUR_DELAY_ATTACH DETOUR_DELAY_ATTACH, *PDETOUR_DELAY_ATTACH;
-
-struct _DETOUR_DELAY_ATTACH
-{
-    PDETOUR_DELAY_ATTACH pNext;
-    UNICODE_STRING usDllName;
-    PCSTR pszFunction;
-    PVOID* ppPointer;
-    PVOID pDetour;
-    DETOUR_DELAY_ATTACH_CALLBACK pfnCallback;
-    PVOID Context;
-};
-
-static const ANSI_STRING g_asLdrRegisterDllNotification = RTL_CONSTANT_STRING("LdrRegisterDllNotification");
-static FN_LdrRegisterDllNotification* g_pfnLdrRegisterDllNotification = NULL;
-static NTSTATUS g_lDelayAttachStatus = STATUS_UNSUCCESSFUL;
-static RTL_RUN_ONCE g_stInitDelayAttach = RTL_RUN_ONCE_INIT;
-static RTL_SRWLOCK g_DelayedAttachesLock = RTL_SRWLOCK_INIT;
-static PVOID g_DllNotifyCookie = NULL;
-static PDETOUR_DELAY_ATTACH g_DelayedAttaches = NULL;
-
-#endif /* (NTDDI_VERSION >= NTDDI_WIN6) */
-
-static HANDLE s_nPendingThreadId = 0; // Thread owning pending transaction.
+static _Interlocked_operand_ HANDLE volatile s_nPendingThreadId = NULL; // Thread owning pending transaction.
 static PHANDLE s_phSuspendedThreads = NULL;
 static ULONG s_ulSuspendedThreadCount = 0;
 static PDETOUR_OPERATION s_pPendingOperations = NULL;
 
 HRESULT
 NTAPI
-SlimDetoursTransactionBegin(VOID)
+SlimDetoursTransactionBeginEx(
+    _In_ PCDETOUR_TRANSACTION_OPTIONS pOptions)
 {
     NTSTATUS Status;
 
     // Make sure only one thread can start a transaction.
-    if (_InterlockedCompareExchangePointer(&s_nPendingThreadId, NtGetCurrentThreadId(), 0) != 0)
+    if (_InterlockedCompareExchangePointer(&s_nPendingThreadId, NtCurrentThreadId(), NULL) != NULL)
     {
         return HRESULT_FROM_NT(STATUS_TRANSACTIONAL_CONFLICT);
     }
@@ -70,11 +37,18 @@ SlimDetoursTransactionBegin(VOID)
         goto fail;
     }
 
-    Status = detour_thread_suspend(&s_phSuspendedThreads, &s_ulSuspendedThreadCount);
-    if (!NT_SUCCESS(Status))
+    if (pOptions->fSuspendThreads)
     {
-        detour_runnable_trampoline_regions();
-        goto fail;
+        Status = detour_thread_suspend(&s_phSuspendedThreads, &s_ulSuspendedThreadCount);
+        if (!NT_SUCCESS(Status))
+        {
+            detour_runnable_trampoline_regions();
+            goto fail;
+        }
+    } else
+    {
+        s_phSuspendedThreads = NULL;
+        s_ulSuspendedThreadCount = 0;
     }
 
     s_pPendingOperations = NULL;
@@ -84,7 +58,7 @@ fail:
 #ifdef _MSC_VER
 #pragma warning(disable: __WARNING_INTERLOCKED_ACCESS)
 #endif
-    s_nPendingThreadId = 0;
+    s_nPendingThreadId = NULL;
 #ifdef _MSC_VER
 #pragma warning(default: __WARNING_INTERLOCKED_ACCESS)
 #endif
@@ -99,7 +73,7 @@ SlimDetoursTransactionAbort(VOID)
     SIZE_T sMem;
     DWORD dwOld;
 
-    if (s_nPendingThreadId != NtGetCurrentThreadId())
+    if (s_nPendingThreadId != NtCurrentThreadId())
     {
         return HRESULT_FROM_NT(STATUS_TRANSACTIONAL_CONFLICT);
     }
@@ -111,13 +85,10 @@ SlimDetoursTransactionAbort(VOID)
         pMem = o->pbTarget;
         sMem = o->pTrampoline->cbRestore;
         NtProtectVirtualMemory(NtCurrentProcess(), &pMem, &sMem, o->dwPerm, &dwOld);
-        if (!o->fIsRemove)
+        if (o->fIsAdd)
         {
-            if (o->pTrampoline)
-            {
-                detour_free_trampoline(o->pTrampoline);
-                o->pTrampoline = NULL;
-            }
+            detour_free_trampoline(o->pTrampoline);
+            o->pTrampoline = NULL;
         }
 
         PDETOUR_OPERATION n = o->pNext;
@@ -134,7 +105,7 @@ SlimDetoursTransactionAbort(VOID)
 
     s_phSuspendedThreads = NULL;
     s_ulSuspendedThreadCount = 0;
-    s_nPendingThreadId = 0;
+    s_nPendingThreadId = NULL;
     return HRESULT_FROM_NT(STATUS_SUCCESS);
 }
 
@@ -152,7 +123,7 @@ SlimDetoursTransactionCommit(VOID)
     BOOL freed = FALSE;
     ULONG i;
 
-    if (s_nPendingThreadId != NtGetCurrentThreadId())
+    if (s_nPendingThreadId != NtCurrentThreadId())
     {
         return HRESULT_FROM_NT(STATUS_TRANSACTIONAL_CONFLICT);
     }
@@ -168,10 +139,29 @@ SlimDetoursTransactionCommit(VOID)
     {
         if (o->fIsRemove)
         {
-            RtlCopyMemory(o->pbTarget, o->pTrampoline->rbRestore, o->pTrampoline->cbRestore);
-            NtFlushInstructionCache(NtCurrentProcess(), o->pbTarget, o->pTrampoline->cbRestore);
+            // Check if the jmps still points where we expect, otherwise someone might have hooked us.
+            BOOL hookIsStillThere =
+#if defined(_X86_) || defined(_AMD64_)
+                detour_is_jmp_immediate_to(o->pbTarget, o->pTrampoline->rbCodeIn) &&
+                detour_is_jmp_indirect_to(o->pTrampoline->rbCodeIn, &o->pTrampoline->pbDetour);
+#elif defined(_ARM64_)
+                detour_is_jmp_indirect_to(o->pbTarget, (ULONG64*)&(o->pTrampoline->pbDetour));
+#endif
+
+            if (hookIsStillThere)
+            {
+                RtlCopyMemory(o->pbTarget, o->pTrampoline->rbRestore, o->pTrampoline->cbRestore);
+                NtFlushInstructionCache(NtCurrentProcess(), o->pbTarget, o->pTrampoline->cbRestore);
+            } else
+            {
+                // Don't remove in this case, put in bypass mode and leak trampoline.
+                o->fIsRemove = FALSE;
+                o->pTrampoline->pbDetour = o->pTrampoline->rbCode;
+                DETOUR_TRACE("detours: Leaked hook on pbTarget=%p due to external hooking\n", o->pbTarget);
+            }
+
             *o->ppbPointer = o->pbTarget;
-        } else
+        } else if (o->fIsAdd)
         {
             DETOUR_TRACE("detours: pbTramp =%p, pbRemain=%p, pbDetour=%p, cbRestore=%u\n",
                          o->pTrampoline,
@@ -188,12 +178,10 @@ SlimDetoursTransactionCommit(VOID)
                          o->pbTarget[4], o->pbTarget[5], o->pbTarget[6], o->pbTarget[7],
                          o->pbTarget[8], o->pbTarget[9], o->pbTarget[10], o->pbTarget[11]);
 
-#if defined(_AMD64_)
+#if defined(_X86_) || defined(_AMD64_)
             pbCode = detour_gen_jmp_indirect(o->pTrampoline->rbCodeIn, &o->pTrampoline->pbDetour);
-            NtFlushInstructionCache(NtCurrentProcess(), pbCode, pbCode - o->pTrampoline->rbCodeIn);
+            NtFlushInstructionCache(NtCurrentProcess(), o->pTrampoline->rbCodeIn, pbCode - o->pTrampoline->rbCodeIn);
             pbCode = detour_gen_jmp_immediate(o->pbTarget, o->pTrampoline->rbCodeIn);
-#elif defined(_X86_)
-            pbCode = detour_gen_jmp_immediate(o->pbTarget, o->pTrampoline->pbDetour);
 #elif defined(_ARM64_)
             pbCode = detour_gen_jmp_indirect(o->pbTarget, (ULONG64*)&(o->pTrampoline->pbDetour));
 #endif
@@ -240,7 +228,7 @@ SlimDetoursTransactionCommit(VOID)
         pMem = o->pbTarget;
         sMem = o->pTrampoline->cbRestore;
         NtProtectVirtualMemory(NtCurrentProcess(), &pMem, &sMem, o->dwPerm, &dwOld);
-        if (o->fIsRemove && o->pTrampoline)
+        if (o->fIsRemove)
         {
             detour_free_trampoline(o->pTrampoline);
             o->pTrampoline = NULL;
@@ -265,7 +253,7 @@ _exit:
     detour_thread_resume(s_phSuspendedThreads, s_ulSuspendedThreadCount);
     s_phSuspendedThreads = NULL;
     s_ulSuspendedThreadCount = 0;
-    s_nPendingThreadId = 0;
+    s_nPendingThreadId = NULL;
 
     return HRESULT_FROM_NT(STATUS_SUCCESS);
 }
@@ -281,7 +269,7 @@ SlimDetoursAttach(
     SIZE_T sMem;
     DWORD dwOld;
 
-    if (s_nPendingThreadId != NtGetCurrentThreadId())
+    if (s_nPendingThreadId != NtCurrentThreadId())
     {
         return HRESULT_FROM_NT(STATUS_TRANSACTIONAL_CONFLICT);
     }
@@ -297,6 +285,7 @@ SlimDetoursAttach(
     // This happens when the detour does nothing other than call the target.
     if (pDetour == (PVOID)pbTarget)
     {
+        Status = STATUS_INVALID_PARAMETER;
         DETOUR_BREAK();
         goto fail;
     }
@@ -462,6 +451,7 @@ fail:
                  pTrampoline->rbCode[8], pTrampoline->rbCode[9],
                  pTrampoline->rbCode[10], pTrampoline->rbCode[11]);
 
+    o->fIsAdd = TRUE;
     o->fIsRemove = FALSE;
     o->ppbPointer = (PBYTE*)ppPointer;
     o->pTrampoline = pTrampoline;
@@ -484,7 +474,7 @@ SlimDetoursDetach(
     SIZE_T sMem;
     DWORD dwOld;
 
-    if (s_nPendingThreadId != NtGetCurrentThreadId())
+    if (s_nPendingThreadId != NtCurrentThreadId())
     {
         return HRESULT_FROM_NT(STATUS_TRANSACTIONAL_CONFLICT);
     }
@@ -502,7 +492,7 @@ fail:
         return HRESULT_FROM_NT(Status);
     }
 
-    PDETOUR_TRAMPOLINE pTrampoline = (PDETOUR_TRAMPOLINE)detour_skip_jmp((PBYTE)*ppPointer);
+    PDETOUR_TRAMPOLINE pTrampoline = (PDETOUR_TRAMPOLINE)*ppPointer;
     pDetour = detour_skip_jmp((PBYTE)pDetour);
 
     ////////////////////////////////////// Verify that Trampoline is in place.
@@ -525,6 +515,7 @@ fail:
         goto fail;
     }
 
+    o->fIsAdd = FALSE;
     o->fIsRemove = TRUE;
     o->ppbPointer = (PBYTE*)ppPointer;
     o->pTrampoline = pTrampoline;
@@ -536,223 +527,16 @@ fail:
     return HRESULT_FROM_NT(STATUS_SUCCESS);
 }
 
-#if (NTDDI_VERSION >= NTDDI_WIN6)
-
-static
 HRESULT
 NTAPI
-detour_attach_now(
-    _Out_ PVOID* ppPointer,
-    _In_ PVOID pDetour,
-    _In_ PVOID DllBase,
-    _In_ PCSTR Function)
+SlimDetoursUninitialize(VOID)
 {
-    NTSTATUS Status;
-    HRESULT hr;
-    ANSI_STRING FunctionString;
-    ULONG Ordinal;
-    PANSI_STRING pFunctionString;
-    PVOID FunctionAddress;
+    NTSTATUS Status = STATUS_SUCCESS;
 
-    if ((ULONG_PTR)Function <= MAXUSHORT)
+    if (!detour_memory_uninitialize())
     {
-        Ordinal = (ULONG)(ULONG_PTR)Function;
-        if (Ordinal == 0)
-        {
-            return HRESULT_FROM_NT(STATUS_INVALID_PARAMETER);
-        }
-        pFunctionString = NULL;
-    } else
-    {
-        Ordinal = 0;
-        Status = RtlInitAnsiStringEx(&FunctionString, Function);
-        if (!NT_SUCCESS(Status))
-        {
-            return HRESULT_FROM_NT(Status);
-        }
-        pFunctionString = &FunctionString;
-    }
-    /*
-     * False positive.
-     * Ordinal always > 0 when pFunctionString is NULL,
-     * SAL is right but compiler didn't recognize Ordinal than immediate value
-     */
-#pragma warning(disable: __WARNING_INVALID_PARAM_VALUE_1)
-    Status = LdrGetProcedureAddress(DllBase, pFunctionString, Ordinal, &FunctionAddress);
-#pragma warning(default: __WARNING_INVALID_PARAM_VALUE_1)
-    if (!NT_SUCCESS(Status))
-    {
-        return HRESULT_FROM_NT(Status);
+        Status = STATUS_INVALID_HANDLE;
     }
 
-    hr = SlimDetoursTransactionBegin();
-    if (FAILED(hr))
-    {
-        return hr;
-    }
-    *ppPointer = FunctionAddress;
-    hr = SlimDetoursAttach(ppPointer, pDetour);
-    if (FAILED(Status))
-    {
-        SlimDetoursTransactionAbort();
-        return hr;
-    }
-    return SlimDetoursTransactionCommit();
-}
-
-static
-VOID
-CALLBACK
-detour_dll_notify_proc(
-    _In_ ULONG NotificationReason,
-    _In_ PCLDR_DLL_NOTIFICATION_DATA NotificationData,
-    _In_opt_ PVOID Context)
-{
-    HRESULT hr;
-    PDETOUR_DELAY_ATTACH pAttach, pPrevAttach, pNextAttach;
-
-    if (NotificationReason != LDR_DLL_NOTIFICATION_REASON_LOADED || g_DelayedAttaches == NULL)
-    {
-        return;
-    }
-
-    RtlAcquireSRWLockExclusive(&g_DelayedAttachesLock);
-    pPrevAttach = NULL;
-    pAttach = g_DelayedAttaches;
-    while (pAttach != NULL)
-    {
-        /* Match Dll name */
-        if (!RtlEqualUnicodeString(&pAttach->usDllName, NotificationData->Loaded.BaseDllName, FALSE))
-        {
-            pPrevAttach = pAttach;
-            pAttach = pAttach->pNext;
-            continue;
-        }
-
-        /* Attach detours */
-        hr = detour_attach_now(pAttach->ppPointer,
-                               pAttach->pDetour,
-                               NotificationData->Loaded.DllBase,
-                               pAttach->pszFunction);
-        if (pAttach->pfnCallback != NULL)
-        {
-            pAttach->pfnCallback(hr,
-                                 pAttach->ppPointer,
-                                 pAttach->usDllName.Buffer,
-                                 pAttach->pszFunction,
-                                 pAttach->Context);
-        }
-
-        /* Free the delayed attach node */
-        pNextAttach = pAttach->pNext;
-        detour_memory_free(pAttach);
-        if (pPrevAttach != NULL)
-        {
-            pPrevAttach->pNext = pNextAttach;
-        } else
-        {
-            g_DelayedAttaches = pNextAttach;
-        }
-        pAttach = pNextAttach;
-    }
-    RtlReleaseSRWLockExclusive(&g_DelayedAttachesLock);
-}
-
-static
-_Function_class_(RTL_RUN_ONCE_INIT_FN)
-_IRQL_requires_same_
-LOGICAL
-NTAPI
-detour_init_delay_attach(
-    _Inout_ PRTL_RUN_ONCE RunOnce,
-    _Inout_opt_ PVOID Parameter,
-    _Inout_opt_ PVOID *Context)
-{
-    g_lDelayAttachStatus = LdrGetProcedureAddress(NtGetNtdllBase(),
-                                                  (PANSI_STRING)&g_asLdrRegisterDllNotification,
-                                                  0,
-                                                  (PVOID*)&g_pfnLdrRegisterDllNotification);
-    return NT_SUCCESS(g_lDelayAttachStatus);
-}
-
-HRESULT
-NTAPI
-SlimDetoursDelayAttach(
-    _In_ PVOID* ppPointer,
-    _In_ PVOID pDetour,
-    _In_ PCWSTR DllName,
-    _In_ PCSTR Function,
-    _In_opt_ __callback DETOUR_DELAY_ATTACH_CALLBACK Callback,
-    _In_opt_ PVOID Context)
-{
-    NTSTATUS Status;
-    HRESULT hr;
-    UNICODE_STRING DllNameString;
-    PVOID DllBase;
-    PDETOUR_DELAY_ATTACH NewNode;
-
-    /* Don't need try/except */
-#pragma warning(disable: __WARNING_PROBE_NO_TRY)
-    Status = RtlRunOnceExecuteOnce(&g_stInitDelayAttach, detour_init_delay_attach, NULL, NULL);
-#pragma warning(default: __WARNING_PROBE_NO_TRY)
-    if (!NT_SUCCESS(Status))
-    {
-        return HRESULT_FROM_NT(Status);
-    }
-
-    /* Check if Dll is already loaded */
-    RtlInitUnicodeStringEx(&DllNameString, DllName);
-    Status = LdrGetDllHandle(NULL, NULL, &DllNameString, &DllBase);
-    if (NT_SUCCESS(Status))
-    {
-        /* Attach immediately if Dll is loaded */
-        hr = detour_attach_now(ppPointer, pDetour, DllBase, Function);
-        if (Callback != NULL)
-        {
-            Callback(hr, ppPointer, DllName, Function, Context);
-        }
-        return hr;
-    } else if (Status != STATUS_DLL_NOT_FOUND)
-    {
-        return HRESULT_FROM_NT(Status);
-    }
-
-    /* Get LdrRegisterDllNotification */
-    if (g_pfnLdrRegisterDllNotification == NULL)
-    {
-        return HRESULT_FROM_NT(g_lDelayAttachStatus);
-    }
-
-    /* Insert into delayed attach list */
-    RtlAcquireSRWLockExclusive(&g_DelayedAttachesLock);
-    if (g_DllNotifyCookie == NULL)
-    {
-        Status = g_pfnLdrRegisterDllNotification(0, detour_dll_notify_proc, NULL, &g_DllNotifyCookie);
-        if (!NT_SUCCESS(Status))
-        {
-            goto _Exit;
-        }
-    }
-
-    NewNode = detour_memory_alloc(sizeof(*NewNode));
-    if (NewNode == NULL)
-    {
-        Status = STATUS_NO_MEMORY;
-        goto _Exit;
-    }
-    NewNode->pNext = g_DelayedAttaches;
-    NewNode->usDllName = DllNameString;
-    NewNode->pszFunction = Function;
-    NewNode->ppPointer = ppPointer;
-    NewNode->pDetour = pDetour;
-    NewNode->pfnCallback = Callback;
-    NewNode->Context = Context;
-    g_DelayedAttaches = NewNode;
-    Status = STATUS_PENDING;
-
-_Exit:
-    RtlReleaseSRWLockExclusive(&g_DelayedAttachesLock);
     return HRESULT_FROM_NT(Status);
 }
-
-#endif /* (NTDDI_VERSION >= NTDDI_WIN6) */

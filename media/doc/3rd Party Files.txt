@@ -309,6 +309,6 @@ URL: https://github.com/microsoft/libdxg
 
 Title: SlimDetours
 Path: sdk/lib/3rdparty/SlimDetours
-Used Version: git commit d0d83130
+Used Version: git commit d8be704
 License: MIT (https://spdx.org/licenses/MIT.html)
 URL: https://github.com/KNSoft/KNSoft.SlimDetours
