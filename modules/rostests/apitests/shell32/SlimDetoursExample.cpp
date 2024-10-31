@@ -51,7 +51,7 @@ START_TEST(SlimDetoursExample)
     }
 
     /* Hook EqualRect and call it */
-    hr = SlimDetoursSetHook(&g_pfnEqualRect, (PVOID)Hooked_EqualRect);
+    hr = SlimDetoursInlineHook(TRUE, &g_pfnEqualRect, (PVOID)Hooked_EqualRect);
     if (FAILED(hr))
     {
         skip("Hook EqualRect failed with: 0x%08lX\n", hr);
