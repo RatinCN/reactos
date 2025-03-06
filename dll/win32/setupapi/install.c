@@ -1610,12 +1610,231 @@ void WINAPI InstallHinfSectionA( HWND hwnd, HINSTANCE handle, LPCSTR cmdline, IN
 }
 
 /***********************************************************************
+ *            dup_section_line_field
+ *
+ * Retrieve the contents of a field in a newly-allocated buffer.
+ */
+static WCHAR *dup_section_line_field( HINF hinf, const WCHAR *section, const WCHAR *line, DWORD index )
+{
+    INFCONTEXT context;
+    DWORD size;
+    WCHAR *buffer;
+
+    if (!SetupFindFirstLineW( hinf, section, line, &context )) return NULL;
+    if (!SetupGetStringFieldW( &context, index, NULL, 0, &size )) return NULL;
+    if (!(buffer = malloc( size * sizeof(WCHAR) ))) return NULL;
+    if (!SetupGetStringFieldW( &context, index, buffer, size, NULL )) buffer[0] = 0;
+    return buffer;
+}
+
+/***********************************************************************
+ *            add_service
+ *
+ * Create a new service. Helper for SetupInstallServicesFromInfSectionW.
+ */
+static BOOL add_service( SC_HANDLE scm, HINF hinf, const WCHAR *name, const WCHAR *section, DWORD flags )
+{
+    struct registry_callback_info info;
+    SC_HANDLE service;
+    INFCONTEXT context;
+    SERVICE_DESCRIPTIONW descr;
+    WCHAR *display_name, *start_name, *load_order, *binary_path;
+    INT service_type = 0, start_type = 0, error_control = 0;
+    DWORD size;
+    HKEY hkey;
+
+    /* first the mandatory fields */
+
+    if (!SetupFindFirstLineW( hinf, section, L"ServiceType", &context ) ||
+        !SetupGetIntField( &context, 1, &service_type ))
+    {
+        SetLastError( ERROR_BAD_SERVICE_INSTALLSECT );
+        return FALSE;
+    }
+    if (!SetupFindFirstLineW( hinf, section, L"StartType", &context ) ||
+        !SetupGetIntField( &context, 1, &start_type ))
+    {
+        SetLastError( ERROR_BAD_SERVICE_INSTALLSECT );
+        return FALSE;
+    }
+    if (!SetupFindFirstLineW( hinf, section, L"ErrorControl", &context ) ||
+        !SetupGetIntField( &context, 1, &error_control ))
+    {
+        SetLastError( ERROR_BAD_SERVICE_INSTALLSECT );
+        return FALSE;
+    }
+    if (!(binary_path = dup_section_line_field( hinf, section, L"ServiceBinary", 1 )))
+    {
+        SetLastError( ERROR_BAD_SERVICE_INSTALLSECT );
+        return FALSE;
+    }
+
+    /* now the optional fields */
+
+    display_name = dup_section_line_field( hinf, section, L"DisplayName", 1 );
+    start_name = dup_section_line_field( hinf, section, L"StartName", 1 );
+    load_order = dup_section_line_field( hinf, section, L"LoadOrderGroup", 1 );
+    descr.lpDescription = dup_section_line_field( hinf, section, L"Description", 1 );
+
+    /* FIXME: Dependencies field */
+    /* FIXME: Security field */
+
+    TRACE( "service %s display %s type %x start %x error %x binary %s order %s startname %s flags %lx\n",
+           debugstr_w(name), debugstr_w(display_name), service_type, start_type, error_control,
+           debugstr_w(binary_path), debugstr_w(load_order), debugstr_w(start_name), flags );
+
+    service = CreateServiceW( scm, name, display_name, SERVICE_ALL_ACCESS,
+                              service_type, start_type, error_control, binary_path,
+                              load_order, NULL, NULL, start_name, NULL );
+    if (service)
+    {
+        if (descr.lpDescription) ChangeServiceConfig2W( service, SERVICE_CONFIG_DESCRIPTION, &descr );
+    }
+    else
+    {
+        if (GetLastError() != ERROR_SERVICE_EXISTS) goto done;
+        service = OpenServiceW( scm, name, SERVICE_QUERY_CONFIG|SERVICE_CHANGE_CONFIG|SERVICE_START );
+        if (!service) goto done;
+
+        if (flags & (SPSVCINST_NOCLOBBER_DISPLAYNAME | SPSVCINST_NOCLOBBER_STARTTYPE |
+                     SPSVCINST_NOCLOBBER_ERRORCONTROL | SPSVCINST_NOCLOBBER_LOADORDERGROUP))
+        {
+            QUERY_SERVICE_CONFIGW *config = NULL;
+
+            if (!QueryServiceConfigW( service, NULL, 0, &size ) &&
+                GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+                config = malloc( size );
+            if (config && QueryServiceConfigW( service, config, size, &size ))
+            {
+                if (flags & SPSVCINST_NOCLOBBER_STARTTYPE) start_type = config->dwStartType;
+                if (flags & SPSVCINST_NOCLOBBER_ERRORCONTROL) error_control = config->dwErrorControl;
+                if (flags & SPSVCINST_NOCLOBBER_DISPLAYNAME)
+                {
+                    free( display_name );
+                    display_name = wcsdup( config->lpDisplayName );
+                }
+                if (flags & SPSVCINST_NOCLOBBER_LOADORDERGROUP)
+                {
+                    free( load_order );
+                    load_order = wcsdup( config->lpLoadOrderGroup );
+                }
+            }
+            free( config );
+        }
+        TRACE( "changing %s display %s type %x start %x error %x binary %s loadorder %s startname %s\n",
+               debugstr_w(name), debugstr_w(display_name), service_type, start_type, error_control,
+               debugstr_w(binary_path), debugstr_w(load_order), debugstr_w(start_name) );
+
+        ChangeServiceConfigW( service, service_type, start_type, error_control, binary_path,
+                              load_order, NULL, NULL, start_name, NULL, display_name );
+
+        if (!(flags & SPSVCINST_NOCLOBBER_DESCRIPTION))
+            ChangeServiceConfig2W( service, SERVICE_CONFIG_DESCRIPTION, &descr );
+    }
+
+    /* execute the AddReg, DelReg and BitReg entries */
+
+    info.default_root = 0;
+    if (!RegOpenKeyW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Services", &hkey ))
+    {
+        RegOpenKeyW( hkey, name, &info.default_root );
+        RegCloseKey( hkey );
+    }
+    if (info.default_root)
+    {
+        info.delete = TRUE;
+        iterate_section_fields( hinf, section, L"DelReg", registry_callback, &info );
+        info.delete = FALSE;
+        iterate_section_fields( hinf, section, L"AddReg", registry_callback, &info );
+        RegCloseKey( info.default_root );
+    }
+    iterate_section_fields( hinf, section, L"BitReg", bitreg_callback, NULL );
+
+    if (flags & SPSVCINST_STARTSERVICE) StartServiceW( service, 0, NULL );
+    CloseServiceHandle( service );
+
+done:
+    if (!service) WARN( "failed err %lu\n", GetLastError() );
+    free( binary_path );
+    free( display_name );
+    free( start_name );
+    free( load_order );
+    free( descr.lpDescription );
+    return service != 0;
+}
+
+
+/***********************************************************************
+ *            del_service
+ *
+ * Delete service. Helper for SetupInstallServicesFromInfSectionW.
+ */
+static BOOL del_service( SC_HANDLE scm, HINF hinf, const WCHAR *name, DWORD flags )
+{
+    BOOL ret;
+    SC_HANDLE service;
+    SERVICE_STATUS status;
+
+    if (!(service = OpenServiceW( scm, name, SERVICE_STOP | DELETE )))
+    {
+        if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) return TRUE;
+        WARN( "cannot open %s err %lu\n", debugstr_w(name), GetLastError() );
+        return FALSE;
+    }
+    if (flags & SPSVCINST_STOPSERVICE) ControlService( service, SERVICE_CONTROL_STOP, &status );
+    TRACE( "deleting %s\n", debugstr_w(name) );
+    ret = DeleteService( service );
+    CloseServiceHandle( service );
+    return ret;
+}
+
+/***********************************************************************
  *              SetupInstallServicesFromInfSectionW  (SETUPAPI.@)
  */
 BOOL WINAPI SetupInstallServicesFromInfSectionW( HINF Inf, PCWSTR SectionName, DWORD Flags)
 {
-    return SetupInstallServicesFromInfSectionExW( Inf, SectionName, Flags,
-                                                  NULL, NULL, NULL, NULL );
+    WCHAR service_name[MAX_INF_STRING_LENGTH];
+    WCHAR service_section[MAX_INF_STRING_LENGTH];
+    SC_HANDLE scm;
+    INFCONTEXT context;
+    INT section_flags;
+    BOOL ret = TRUE;
+
+    if (!SetupFindFirstLineW( Inf, SectionName, NULL, &context ))
+    {
+        SetLastError( ERROR_SECTION_NOT_FOUND );
+        return FALSE;
+    }
+    if (!(scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS ))) return FALSE;
+
+    if (SetupFindFirstLineW( Inf, SectionName, L"AddService", &context ))
+    {
+        do
+        {
+            if (!SetupGetStringFieldW( &context, 1, service_name, MAX_INF_STRING_LENGTH, NULL ))
+                continue;
+            if (!SetupGetIntField( &context, 2, &section_flags )) section_flags = 0;
+            if (!SetupGetStringFieldW( &context, 3, service_section, MAX_INF_STRING_LENGTH, NULL ))
+                continue;
+            if (!(ret = add_service( scm, Inf, service_name, service_section, section_flags | Flags )))
+                goto done;
+        } while (SetupFindNextMatchLineW( &context, L"AddService", &context ));
+    }
+
+    if (SetupFindFirstLineW( Inf, SectionName, L"DelService", &context ))
+    {
+        do
+        {
+            if (!SetupGetStringFieldW( &context, 1, service_name, MAX_INF_STRING_LENGTH, NULL ))
+                continue;
+            if (!SetupGetIntField( &context, 2, &section_flags )) section_flags = 0;
+            if (!(ret = del_service( scm, Inf, service_name, section_flags | Flags ))) goto done;
+        } while (SetupFindNextMatchLineW( &context, L"AddService", &context ));
+    }
+    if (ret) SetLastError( ERROR_SUCCESS );
+ done:
+    CloseServiceHandle( scm );
+    return ret;
 }
 
 /***********************************************************************
@@ -1623,8 +1842,18 @@ BOOL WINAPI SetupInstallServicesFromInfSectionW( HINF Inf, PCWSTR SectionName, D
  */
 BOOL WINAPI SetupInstallServicesFromInfSectionA( HINF Inf, PCSTR SectionName, DWORD Flags)
 {
-    return SetupInstallServicesFromInfSectionExA( Inf, SectionName, Flags,
-                                                  NULL, NULL, NULL, NULL );
+    UNICODE_STRING SectionNameW;
+    BOOL ret = FALSE;
+
+    if (RtlCreateUnicodeStringFromAsciiz( &SectionNameW, SectionName ))
+    {
+        ret = SetupInstallServicesFromInfSectionW( Inf, SectionNameW.Buffer, Flags );
+        RtlFreeUnicodeString( &SectionNameW );
+    }
+    else
+        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+
+    return ret;
 }
 
 /***********************************************************************
